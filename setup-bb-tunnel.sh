@@ -113,28 +113,39 @@ fi
 echo ""
 echo "[4/6] Setting up tunnel '$MAC_NAME'..."
 
-EXISTING=$(cloudflared tunnel list --output json 2>/dev/null | python3 -c "
-import sys, json
-tunnels = json.load(sys.stdin)
-for t in tunnels:
-    if t['name'] == '$MAC_NAME' and not t.get('deleted_at'):
-        print(t['id'])
-        break
-" 2>/dev/null || true)
+# Try to find existing tunnel by name
+TUNNEL_ID=""
+while IFS= read -r line; do
+  # cloudflared tunnel list outputs: ID NAME CREATED CONNECTIONS
+  TUNNEL_NAME=$(echo "$line" | awk '{print $2}')
+  if [ "$TUNNEL_NAME" = "$MAC_NAME" ]; then
+    TUNNEL_ID=$(echo "$line" | awk '{print $1}')
+    break
+  fi
+done < <(cloudflared tunnel list 2>/dev/null | tail -n +2)
 
-if [ -n "$EXISTING" ]; then
-  TUNNEL_ID="$EXISTING"
+# Handle names with spaces — try matching with full line
+if [ -z "$TUNNEL_ID" ]; then
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "$MAC_NAME"; then
+      TUNNEL_ID=$(echo "$line" | awk '{print $1}')
+      break
+    fi
+  done < <(cloudflared tunnel list 2>/dev/null | tail -n +2)
+fi
+
+if [ -n "$TUNNEL_ID" ]; then
   echo "  Tunnel '$MAC_NAME' already exists: $TUNNEL_ID ✓"
 else
-  cloudflared tunnel create "$MAC_NAME"
-  TUNNEL_ID=$(cloudflared tunnel list --output json 2>/dev/null | python3 -c "
-import sys, json
-tunnels = json.load(sys.stdin)
-for t in tunnels:
-    if t['name'] == '$MAC_NAME' and not t.get('deleted_at'):
-        print(t['id'])
-        break
-" 2>/dev/null)
+  CREATE_OUTPUT=$(cloudflared tunnel create "$MAC_NAME" 2>&1)
+  echo "$CREATE_OUTPUT"
+  # Extract UUID from output like "Created tunnel xxx with id xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  TUNNEL_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
+  if [ -z "$TUNNEL_ID" ]; then
+    echo "  ERROR: Failed to create tunnel or extract tunnel ID."
+    echo "  Output was: $CREATE_OUTPUT"
+    exit 1
+  fi
   echo "  Tunnel created: $TUNNEL_ID ✓"
 fi
 
