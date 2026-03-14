@@ -5,18 +5,18 @@ set -euo pipefail
 # BlueBubbles Cloudflare Tunnel Setup (Interactive)
 #
 # Run this on each macOS user account that has a BB instance.
-# It will:
-#   1. Install cloudflared if needed
-#   2. Login to Cloudflare (if needed)
-#   3. Ask for Clerk ID and BB port
-#   4. Create/reuse a tunnel for this Mac
-#   5. Route DNS and generate config
-#   6. Start the tunnel
+# It handles everything: install, login, tunnel, DNS, config,
+# service install, and starts the tunnel.
+#
+# Re-run to add another user on the same Mac — it preserves
+# existing ingress rules.
 # ============================================================
 
 DOMAIN="viatophone.com"
 CONFIG_DIR="$HOME/.cloudflared"
 CONFIG_FILE="$CONFIG_DIR/config.yml"
+SERVICE_CONFIG="/etc/cloudflared/config.yml"
+SERVICE_CREDS_DIR="/etc/cloudflared"
 
 echo ""
 echo "========================================="
@@ -26,24 +26,24 @@ echo ""
 
 # Step 1: Install cloudflared
 if ! command -v cloudflared &> /dev/null; then
-  echo "[1/6] cloudflared not found. Installing..."
+  echo "[1/7] cloudflared not found. Installing..."
   if command -v brew &> /dev/null; then
     brew install cloudflared
   else
-    echo "Homebrew not found. Install cloudflared manually:"
-    echo "  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-    exit 1
+    echo "Homebrew not found. Installing Homebrew first..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    brew install cloudflared
   fi
   echo "  Installed."
 else
-  echo "[1/6] cloudflared already installed. ✓"
+  echo "[1/7] cloudflared already installed."
 fi
 
 # Step 2: Login
 if [ -f "$CONFIG_DIR/cert.pem" ]; then
-  echo "[2/6] Already logged in to Cloudflare. ✓"
+  echo "[2/7] Already logged in to Cloudflare."
 else
-  echo "[2/6] Logging in to Cloudflare..."
+  echo "[2/7] Logging in to Cloudflare..."
   echo "  A browser window will open. Select '$DOMAIN' and authorize."
   echo ""
   cloudflared tunnel login
@@ -51,19 +51,21 @@ else
     echo "  ERROR: Login failed. Try again."
     exit 1
   fi
-  echo "  Logged in. ✓"
+  echo "  Logged in."
 fi
 
 # Step 3: Gather info
 echo ""
-echo "[3/6] Enter setup info:"
+echo "[3/7] Enter setup info:"
 echo ""
 
-read -p "  Mac name (e.g. mac-mini-1, joes-mac): " MAC_NAME
+read -p "  Mac name (use dashes, no spaces, e.g. mm-az-03): " MAC_NAME
 if [ -z "$MAC_NAME" ]; then
   echo "  ERROR: Mac name is required."
   exit 1
 fi
+# Replace spaces with dashes
+MAC_NAME=$(echo "$MAC_NAME" | tr ' ' '-')
 
 read -p "  Clerk ID (e.g. user_3AMAoFUsg7KxtLyayVwqGRMMVoq): " CLERK_ID
 if [ -z "$CLERK_ID" ]; then
@@ -71,28 +73,11 @@ if [ -z "$CLERK_ID" ]; then
   exit 1
 fi
 
-# Auto-detect BB port
-BB_PORT=""
-BB_PID=$(pgrep -f "BlueBubbles" 2>/dev/null | head -1 || true)
-if [ -n "$BB_PID" ]; then
-  # Try to find the listening port from lsof
-  DETECTED_PORT=$(lsof -iTCP -sTCP:LISTEN -P -n -p "$BB_PID" 2>/dev/null | grep LISTEN | awk '{print $9}' | grep -o '[0-9]*$' | head -1 || true)
-  if [ -n "$DETECTED_PORT" ]; then
-    echo ""
-    echo "  Detected BlueBubbles running on port $DETECTED_PORT"
-    read -p "  Use port $DETECTED_PORT? (Y/n): " USE_DETECTED
-    if [ -z "$USE_DETECTED" ] || [[ "$USE_DETECTED" =~ ^[Yy] ]]; then
-      BB_PORT="$DETECTED_PORT"
-    fi
-  fi
-fi
-
+# Ask for BB port (don't auto-detect — it picks up wrong ports)
+read -p "  BlueBubbles port (check BB settings): " BB_PORT
 if [ -z "$BB_PORT" ]; then
-  read -p "  BlueBubbles port: " BB_PORT
-  if [ -z "$BB_PORT" ]; then
-    echo "  ERROR: Port is required."
-    exit 1
-  fi
+  echo "  ERROR: Port is required."
+  exit 1
 fi
 
 SUBDOMAIN="${CLERK_ID}.${DOMAIN}"
@@ -111,42 +96,26 @@ fi
 
 # Step 4: Create or reuse tunnel
 echo ""
-echo "[4/6] Setting up tunnel '$MAC_NAME'..."
+echo "[4/7] Setting up tunnel '$MAC_NAME'..."
 
-# Try to find existing tunnel by name
 TUNNEL_ID=""
-while IFS= read -r line; do
-  # cloudflared tunnel list outputs: ID NAME CREATED CONNECTIONS
-  TUNNEL_NAME=$(echo "$line" | awk '{print $2}')
-  if [ "$TUNNEL_NAME" = "$MAC_NAME" ]; then
-    TUNNEL_ID=$(echo "$line" | awk '{print $1}')
-    break
-  fi
-done < <(cloudflared tunnel list 2>/dev/null | tail -n +2)
 
-# Handle names with spaces — try matching with full line
-if [ -z "$TUNNEL_ID" ]; then
-  while IFS= read -r line; do
-    if echo "$line" | grep -q "$MAC_NAME"; then
-      TUNNEL_ID=$(echo "$line" | awk '{print $1}')
-      break
-    fi
-  done < <(cloudflared tunnel list 2>/dev/null | tail -n +2)
+# Check existing tunnels
+if cloudflared tunnel list 2>/dev/null | grep -q "$MAC_NAME"; then
+  TUNNEL_ID=$(cloudflared tunnel list 2>/dev/null | grep "$MAC_NAME" | awk '{print $1}')
 fi
 
 if [ -n "$TUNNEL_ID" ]; then
-  echo "  Tunnel '$MAC_NAME' already exists: $TUNNEL_ID ✓"
+  echo "  Tunnel '$MAC_NAME' already exists: $TUNNEL_ID"
 else
   CREATE_OUTPUT=$(cloudflared tunnel create "$MAC_NAME" 2>&1)
   echo "$CREATE_OUTPUT"
-  # Extract UUID from output like "Created tunnel xxx with id xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
   TUNNEL_ID=$(echo "$CREATE_OUTPUT" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
   if [ -z "$TUNNEL_ID" ]; then
     echo "  ERROR: Failed to create tunnel or extract tunnel ID."
-    echo "  Output was: $CREATE_OUTPUT"
     exit 1
   fi
-  echo "  Tunnel created: $TUNNEL_ID ✓"
+  echo "  Tunnel created: $TUNNEL_ID"
 fi
 
 CREDS_FILE="$CONFIG_DIR/$TUNNEL_ID.json"
@@ -155,77 +124,106 @@ if [ ! -f "$CREDS_FILE" ]; then
   exit 1
 fi
 
-# Step 5: Route DNS + write config
+# Step 5: Route DNS + write user config
 echo ""
-echo "[5/6] Routing DNS and writing config..."
+echo "[5/7] Routing DNS and writing config..."
 
-cloudflared tunnel route dns "$MAC_NAME" "$SUBDOMAIN" 2>/dev/null && echo "  DNS routed: $SUBDOMAIN ✓" || echo "  DNS route already exists ✓"
+cloudflared tunnel route dns "$MAC_NAME" "$SUBDOMAIN" 2>&1 | grep -v "^$" || true
+echo "  DNS routed: $SUBDOMAIN"
 
-# Check if config already exists with other ingress rules (multi-user Mac)
+# Collect existing ingress entries from current config (if any)
+EXISTING_HOSTNAMES=()
+EXISTING_SERVICES=()
 if [ -f "$CONFIG_FILE" ]; then
-  # Check if this subdomain is already in the config
-  if grep -q "$SUBDOMAIN" "$CONFIG_FILE" 2>/dev/null; then
-    echo "  Subdomain already in config. Updating port..."
-  fi
-
-  # Read existing ingress entries (excluding the catch-all and this subdomain)
-  EXISTING_ENTRIES=$(python3 -c "
-import yaml, sys
-try:
-    with open('$CONFIG_FILE') as f:
-        cfg = yaml.safe_load(f)
-    for rule in cfg.get('ingress', []):
-        hostname = rule.get('hostname', '')
-        service = rule.get('service', '')
-        if hostname and hostname != '$SUBDOMAIN':
-            print(f'{hostname}|{service}')
-except:
-    pass
-" 2>/dev/null || true)
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "hostname:"; then
+      h=$(echo "$line" | sed 's/.*hostname: *//')
+      read -r sline
+      s=$(echo "$sline" | sed 's/.*service: *//')
+      if [ "$h" != "$SUBDOMAIN" ]; then
+        EXISTING_HOSTNAMES+=("$h")
+        EXISTING_SERVICES+=("$s")
+      fi
+    fi
+  done < "$CONFIG_FILE"
 fi
 
-# Write config with all entries
-{
-  echo "tunnel: $TUNNEL_ID"
-  echo "credentials-file: $CREDS_FILE"
+# Write config
+printf "tunnel: %s\ncredentials-file: %s\n\ningress:\n" "$TUNNEL_ID" "$CREDS_FILE" > "$CONFIG_FILE"
+
+for i in "${!EXISTING_HOSTNAMES[@]}"; do
+  printf "  - hostname: %s\n    service: %s\n" "${EXISTING_HOSTNAMES[$i]}" "${EXISTING_SERVICES[$i]}" >> "$CONFIG_FILE"
+done
+
+printf "  - hostname: %s\n    service: http://localhost:%s\n  - service: http_status:404\n" "$SUBDOMAIN" "$BB_PORT" >> "$CONFIG_FILE"
+
+echo "  User config written to $CONFIG_FILE"
+echo ""
+cat "$CONFIG_FILE"
+echo ""
+
+# Step 6: Install as service with correct paths
+echo "[6/7] Installing as system service..."
+
+sudo mkdir -p "$SERVICE_CREDS_DIR"
+sudo cp "$CREDS_FILE" "$SERVICE_CREDS_DIR/"
+
+# Write service config with /etc/cloudflared paths
+printf "tunnel: %s\ncredentials-file: %s/%s.json\n\ningress:\n" "$TUNNEL_ID" "$SERVICE_CREDS_DIR" "$TUNNEL_ID" | sudo tee "$SERVICE_CONFIG" > /dev/null
+
+for i in "${!EXISTING_HOSTNAMES[@]}"; do
+  printf "  - hostname: %s\n    service: %s\n" "${EXISTING_HOSTNAMES[$i]}" "${EXISTING_SERVICES[$i]}" | sudo tee -a "$SERVICE_CONFIG" > /dev/null
+done
+
+printf "  - hostname: %s\n    service: http://localhost:%s\n  - service: http_status:404\n" "$SUBDOMAIN" "$BB_PORT" | sudo tee -a "$SERVICE_CONFIG" > /dev/null
+
+echo "  Service config written to $SERVICE_CONFIG"
+echo ""
+sudo cat "$SERVICE_CONFIG"
+echo ""
+
+# Install and start service
+if sudo launchctl list 2>/dev/null | grep -q "com.cloudflare.cloudflared"; then
+  echo "  Service already installed. Restarting..."
+  sudo launchctl stop com.cloudflare.cloudflared 2>/dev/null || true
+  sleep 1
+  sudo launchctl start com.cloudflare.cloudflared
+else
+  sudo cloudflared service install 2>/dev/null || true
+fi
+
+echo "  Service started."
+
+# Step 7: Verify
+echo ""
+echo "[7/7] Verifying tunnel..."
+sleep 3
+
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://$SUBDOMAIN" 2>/dev/null || echo "000")
+
+if [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" = "530" ]; then
+  echo "  WARNING: Tunnel not responding yet (HTTP $HTTP_CODE)."
+  echo "  It may take a minute. Check with:"
+  echo "    curl -s https://$SUBDOMAIN"
   echo ""
-  echo "ingress:"
+  echo "  If it keeps failing, check service logs:"
+  echo "    sudo log show --predicate 'process == \"cloudflared\"' --last 5m"
+else
+  echo "  Tunnel is live! (HTTP $HTTP_CODE)"
+fi
 
-  # Re-add existing entries (other users on this Mac)
-  if [ -n "${EXISTING_ENTRIES:-}" ]; then
-    while IFS='|' read -r hostname service; do
-      echo "  - hostname: $hostname"
-      echo "    service: $service"
-    done <<< "$EXISTING_ENTRIES"
-  fi
-
-  # Add this user
-  echo "  - hostname: $SUBDOMAIN"
-  echo "    service: http://localhost:$BB_PORT"
-  echo "  - service: http_status:404"
-} > "$CONFIG_FILE"
-
-echo "  Config written ✓"
 echo ""
-echo "  Config contents:"
-echo "  ---"
-cat "$CONFIG_FILE" | sed 's/^/  /'
-echo "  ---"
-
-# Step 6: Print next steps
+echo "========================================="
+echo "  Setup complete!"
+echo "========================================="
 echo ""
-echo "[6/6] Done! Next steps:"
+echo "  Permanent URL: https://$SUBDOMAIN"
+echo "  Tunnel runs on boot automatically."
 echo ""
-echo "  1. Start the tunnel:"
-echo "     cloudflared tunnel run $MAC_NAME"
+echo "  DB update SQL:"
+echo "  UPDATE \"user_Data\""
+echo "    SET \"phone_System\" = jsonb_set(\"phone_System\", '{blueBubblesUrl}', '\"https://$SUBDOMAIN\"')"
+echo "    WHERE \"clerk_Id\" = '$CLERK_ID';"
 echo ""
-echo "  2. Update the DB (run in Supabase SQL editor):"
-echo "     UPDATE \"user_Data\""
-echo "       SET \"phone_System\" = jsonb_set(\"phone_System\", '{blueBubblesUrl}', '\"https://$SUBDOMAIN\"')"
-echo "       WHERE \"clerk_Id\" = '$CLERK_ID';"
-echo ""
-echo "  3. To run on boot (optional):"
-echo "     sudo cloudflared service install"
-echo ""
-echo "  To add another user on this same Mac, run this script again."
+echo "  To add another user on this Mac, run this script again."
 echo ""
