@@ -2,7 +2,7 @@ tunnel: 732544ad-8653-4e8b-a1d0-75514d7301c7
 credentials-file: /etc/cloudflared/732544ad-8653-4e8b-a1d0-75514d7301c7.json
 
 ingress:
-  - hostname: user_3AMAoFUsg7KxtLyayVwqGRMMVoq.viatophone.com
+  - hostname: user_3amaofusg7kxtlyayvwqgrmmvoq.viatophone.com
     service: http://localhost:1230
     originRequest:
       httpHostHeader: localhost:1230
